@@ -1,0 +1,1787 @@
+diff -ruN a/src/completers/pos-completer-hunspell.c b/src/completers/pos-completer-hunspell.c
+--- a/src/completers/pos-completer-hunspell.c	2026-11-04 07:27:33.950291203 +0200
++++ b/src/completers/pos-completer-hunspell.c	2026-11-04 07:27:33.957230600 +0200
+@@ -59,6 +59,7 @@
+ 
+ static void pos_completer_hunspell_interface_init (PosCompleterInterface *iface);
+ static void pos_completer_hunspell_initable_interface_init (GInitableIface *iface);
++static void pos_completer_hunspell_lookup (PosCompleterHunspell *self);
+ 
+ G_DEFINE_TYPE_WITH_CODE (PosCompleterHunspell, pos_completer_hunspell, POS_TYPE_COMPLETER_BASE,
+                          G_IMPLEMENT_INTERFACE (POS_TYPE_COMPLETER,
+@@ -128,6 +129,10 @@
+   pos_completer_base_set_surrounding_text (POS_COMPLETER_BASE (self),
+                                            before_text,
+                                            after_text);
++
++  /* Nothing typed yet but the cursor may be inside a word: suggest for it */
++  if (self->preedit->len == 0)
++    pos_completer_hunspell_lookup (self);
+ }
+ 
+ 
+@@ -389,17 +394,143 @@
+ }
+ 
+ 
++/**
++ * pos_completer_hunspell_get_word_parts:
++ * @self: The completer
++ * @left: (out): The part of the surrounding word before the preedit
++ * @right: (out): The part of the surrounding word after the preedit
++ *
++ * Gets the parts of the word around the cursor from the surrounding
++ * text. The protocol excludes the preedit from the surrounding text so
++ * the preedit goes between the two parts.
++ *
++ * Returns: %TRUE if the cursor touches a word in the surrounding text
++ */
+ static gboolean
+-pos_completer_hunspell_feed_symbol (PosCompleter *iface, const char *symbol)
++pos_completer_hunspell_get_word_parts (PosCompleterHunspell *self, char **left, char **right)
+ {
+-  PosCompleterHunspell *self = POS_COMPLETER_HUNSPELL (iface);
+-  g_autofree char *preedit = g_strdup (self->preedit->str);
++  PosCompleterBase *base = POS_COMPLETER_BASE (self);
++  g_autofree char *l = NULL;
++  g_autofree char *r = NULL;
++
++  *left = NULL;
++  *right = NULL;
++
++  if (!pos_completer_word_at_cursor (pos_completer_base_get_before_text (base),
++                                     pos_completer_base_get_after_text (base),
++                                     &l, &r))
++    return FALSE;
++
++  *left = g_steal_pointer (&l);
++  *right = g_steal_pointer (&r);
++  return TRUE;
++}
++
++
++/**
++ * pos_completer_hunspell_lookup:
++ * @self: The completer
++ *
++ * Looks up the word around the cursor: the surrounding text before the
++ * cursor up to the previous word separator, the preedit and the
++ * surrounding text after the cursor up to the next word separator.
++ */
++static void
++pos_completer_hunspell_lookup (PosCompleterHunspell *self)
++{
++  g_autofree char *left = NULL;
++  g_autofree char *right = NULL;
++  g_autofree char *word = NULL;
+   g_autofree char *input = NULL;
+   g_autoptr (GStrvBuilder) builder = g_strv_builder_new ();
+   g_auto (GStrv) completions = NULL;
+   char **suggestions;
+   int ret;
+ 
++  pos_completer_hunspell_get_word_parts (self, &left, &right);
++  word = g_strconcat (left ?: "", self->preedit->str, right ?: "", NULL);
++
++  if (!*word) {
++    pos_completer_hunspell_set_completions (POS_COMPLETER (self), NULL, FALSE);
++    return;
++  }
++
++  g_debug ("Looking up string '%s' (preedit '%s', before '%s', after '%s')",
++           word, self->preedit->str, left ?: "", right ?: "");
++
++  input = convert_from_utf8 (self, word);
++  if (Hunspell_spell (self->handle, input))
++    g_strv_builder_add (builder, word);
++
++  ret = Hunspell_suggest (self->handle, &suggestions, input);
++  if (ret > 0) {
++    for (int i = 0; i < ret && i < self->max_completions; i++) {
++      char *utf8 = convert_to_utf8 (self, suggestions[i]);
++
++      if (utf8)
++        g_strv_builder_take (builder, utf8);
++    }
++    Hunspell_free_list (self->handle, &suggestions, ret);
++  }
++
++  completions = g_strv_builder_end (builder);
++  pos_completer_hunspell_set_completions (POS_COMPLETER (self), completions, TRUE);
++}
++
++
++/**
++ * pos_completer_hunspell_set_selected:
++ * @iface: The completer
++ * @selected: The selected completion
++ *
++ * When the completion was looked up for a word that extends into the
++ * surrounding text, replace that word: delete its parts around the
++ * cursor and commit the completion in one go. A space follows unless
++ * the text after the word already starts with a word separator.
++ *
++ * Returns: %TRUE if the selection was handled here
++ */
++static gboolean
++pos_completer_hunspell_set_selected (PosCompleter *iface, const char *selected)
++{
++  PosCompleterHunspell *self = POS_COMPLETER_HUNSPELL (iface);
++  PosCompleterBase *base = POS_COMPLETER_BASE (self);
++  g_autofree char *left = NULL;
++  g_autofree char *right = NULL;
++  g_autofree char *send = NULL;
++  const char *after, *rest;
++  gsize del_before, del_after;
++  gboolean add_space = TRUE;
++
++  if (!pos_completer_hunspell_get_word_parts (self, &left, &right))
++    return FALSE;
++
++  del_before = left ? strlen (left) : 0;
++  del_after = right ? strlen (right) : 0;
++
++  after = pos_completer_base_get_after_text (base);
++  rest = after + MIN (del_after, strlen (after));
++  if (*rest) {
++    g_autofree char *symbol = g_strndup (rest, g_utf8_next_char (rest) - rest);
++
++    if (pos_completer_symbol_is_word_separator (symbol, NULL))
++      add_space = FALSE;
++  }
++
++  send = g_strdup_printf ("%s%s", selected, add_space ? " " : "");
++  g_debug ("Replacing word: %zu bytes before, %zu after with '%s'", del_before, del_after, send);
++  g_signal_emit_by_name (self, "commit-string", send, (int)del_before, (int)del_after);
++
++  return TRUE;
++}
++
++
++static gboolean
++pos_completer_hunspell_feed_symbol (PosCompleter *iface, const char *symbol)
++{
++  PosCompleterHunspell *self = POS_COMPLETER_HUNSPELL (iface);
++  g_autofree char *preedit = g_strdup (self->preedit->str);
++
+   if (pos_completer_add_preedit (POS_COMPLETER (self), self->preedit, symbol)) {
+     PosCompleterBase *base = POS_COMPLETER_BASE (self);
+     int before = 0;
+@@ -424,25 +555,7 @@
+ 
+   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
+ 
+-  g_debug ("Looking up string '%s'", self->preedit->str);
+-
+-  input = convert_from_utf8 (self, self->preedit->str);
+-  if (Hunspell_spell (self->handle, input))
+-    g_strv_builder_add (builder, self->preedit->str);
+-
+-  ret = Hunspell_suggest (self->handle, &suggestions, input);
+-  if (ret > 0) {
+-    for (int i = 0; i < ret && i < self->max_completions; i++) {
+-      char *utf8 = convert_to_utf8 (self, suggestions[i]);
+-
+-      if (utf8)
+-        g_strv_builder_take (builder, utf8);
+-    }
+-    Hunspell_free_list (self->handle, &suggestions, ret);
+-  }
+-
+-  completions = g_strv_builder_end (builder);
+-  pos_completer_hunspell_set_completions (POS_COMPLETER (self), completions, TRUE);
++  pos_completer_hunspell_lookup (self);
+ 
+   return TRUE;
+ }
+@@ -457,6 +570,7 @@
+   iface->set_preedit = pos_completer_hunspell_set_preedit;
+   iface->set_surrounding_text = pos_completer_hunspell_set_surrounding_text;
+   iface->set_language = pos_completer_hunspell_set_language;
++  iface->set_selected = pos_completer_hunspell_set_selected;
+ }
+ 
+ 
+diff -ruN a/src/meson.build b/src/meson.build
+--- a/src/meson.build	2026-11-04 07:27:33.951488810 +0200
++++ b/src/meson.build	2026-11-04 07:27:33.957957033 +0200
+@@ -70,6 +70,8 @@
+   'pos-main.h',
+   'pos-osk-key.c',
+   'pos-osk-key.h',
++  'pos-osk-gesture.c',
++  'pos-osk-gesture.h',
+   'pos-osk-widget.c',
+   'pos-osk-widget.h',
+   'pos-output.c',
+diff -ruN a/src/phosh-osk-stevia.c b/src/phosh-osk-stevia.c
+--- a/src/phosh-osk-stevia.c	2026-11-04 07:27:33.951512191 +0200
++++ b/src/phosh-osk-stevia.c	2026-11-04 07:27:33.960433961 +0200
+@@ -244,6 +244,14 @@
+ 
+ 
+ static void
++on_activation_filter_changed (PosActivationFilter *filter, char *type, char *id, PosInputMethod *im)
++{
++  /* Revalidate whether to show the OSK when the focused window changed */
++  g_object_notify (G_OBJECT (im), "active");
++}
++
++
++static void
+ on_hw_tracker_allow_active_changed (PosHwTracker *hw_tracker, GParamSpec *pspec, PosInputMethod *im)
+ {
+   /* Revalidate whether to show the OSK when attached hw changed */
+@@ -344,6 +352,11 @@
+                            im,
+                            G_CONNECT_DEFAULT);
+ 
++  g_signal_connect_object (self->activation_filter, "layout-override",
++                           G_CALLBACK (on_activation_filter_changed),
++                           im,
++                           G_CONNECT_DEFAULT);
++
+   g_signal_connect_object (self->activation_filter, "layout-override",
+                            G_CALLBACK (on_layout_override),
+                            self->input_surface,
+diff -ruN a/src/pos-activation-filter.c b/src/pos-activation-filter.c
+--- a/src/pos-activation-filter.c	2026-11-04 07:27:33.951548502 +0200
++++ b/src/pos-activation-filter.c	2026-11-04 07:27:33.957775767 +0200
+@@ -90,6 +90,9 @@
+ 
+   if (self->active == NULL || gm_str_is_null_or_empty (self->active->app_id)) {
+     g_debug ("Clearing layout override");
++    /* No focused window (home screen): the compositor may never send
++     * deactivate for the window that went away, so don't keep the OSK up */
++    self->allow_active = FALSE;
+     g_signal_emit (self, signals[LAYOUT_OVERRIDE], 0, "", "");
+     return;
+   }
+diff -ruN a/src/pos-char-popup.c b/src/pos-char-popup.c
+--- a/src/pos-char-popup.c	2026-11-04 07:27:33.951588673 +0200
++++ b/src/pos-char-popup.c	2026-11-04 07:27:33.960721930 +0200
+@@ -149,6 +149,71 @@
+   }
+ }
+ 
++/* The button of the popup under (x, y), given in @rel's coordinates (the widget
++ * the popup is relative to), or NULL. Used for press, slide and release. */
++static GtkWidget *
++pos_char_popup_button_at (PosCharPopup *self, GtkWidget *rel, double x, double y)
++{
++  GList *children = gtk_container_get_children (GTK_CONTAINER (self->symbols_grid));
++  GtkWidget *hit = NULL;
++
++  for (GList *l = children; l; l = l->next) {
++    GtkWidget *btn = l->data;
++    GtkAllocation alloc;
++    int bx = 0, by = 0;
++
++    if (!gtk_widget_translate_coordinates (btn, rel, 0, 0, &bx, &by))
++      continue;
++    gtk_widget_get_allocation (btn, &alloc);
++    if (x >= bx && x < bx + alloc.width && y >= by && y < by + alloc.height) {
++      hit = btn;
++      break;
++    }
++  }
++  g_list_free (children);
++  return hit;
++}
++
++
++/* Highlight the button under the finger while it slides over the popup. */
++void
++pos_char_popup_slide_to (PosCharPopup *self, GtkWidget *rel, double x, double y)
++{
++  GList *children;
++  GtkWidget *hit;
++
++  g_return_if_fail (POS_IS_CHAR_POPUP (self));
++
++  hit = pos_char_popup_button_at (self, rel, x, y);
++  children = gtk_container_get_children (GTK_CONTAINER (self->symbols_grid));
++  for (GList *l = children; l; l = l->next) {
++    if (l->data == hit)
++      gtk_widget_set_state_flags (l->data, GTK_STATE_FLAG_PRELIGHT, FALSE);
++    else
++      gtk_widget_unset_state_flags (l->data, GTK_STATE_FLAG_PRELIGHT);
++  }
++  g_list_free (children);
++}
++
++
++/* The finger lifted over the popup: select the button under it.
++ * Returns TRUE if a symbol was selected. */
++gboolean
++pos_char_popup_release_at (PosCharPopup *self, GtkWidget *rel, double x, double y)
++{
++  GtkWidget *hit;
++
++  g_return_val_if_fail (POS_IS_CHAR_POPUP (self), FALSE);
++
++  hit = pos_char_popup_button_at (self, rel, x, y);
++  if (hit == NULL)
++    return FALSE;
++
++  on_button_clicked (self, GTK_BUTTON (hit));
++  return TRUE;
++}
++
++
+ void
+ pos_char_popup_set_symbols (PosCharPopup *self, GStrv symbols)
+ {
+diff -ruN a/src/pos-char-popup.h b/src/pos-char-popup.h
+--- a/src/pos-char-popup.h	2026-11-04 07:27:33.951604364 +0200
++++ b/src/pos-char-popup.h	2026-11-04 07:27:33.958044386 +0200
+@@ -17,4 +17,7 @@
+ PosCharPopup *pos_char_popup_new (GtkWidget *relative_to, GStrv symbols);
+ void pos_char_popup_set_symbols (PosCharPopup *self, GStrv symbols);
+ 
++void          pos_char_popup_slide_to    (PosCharPopup *self, GtkWidget *rel, double x, double y);
++gboolean      pos_char_popup_release_at  (PosCharPopup *self, GtkWidget *rel, double x, double y);
++
+ G_END_DECLS
+diff -ruN a/src/pos-completer.c b/src/pos-completer.c
+--- a/src/pos-completer.c	2026-11-04 07:27:33.951708227 +0200
++++ b/src/pos-completer.c	2026-11-04 07:27:33.956759355 +0200
+@@ -693,6 +693,81 @@
+ }
+ 
+ /**
++ * pos_completer_word_at_cursor:
++ * @before: (nullable): The surrounding text before the cursor
++ * @after: (nullable): The surrounding text after the cursor
++ * @left: (out) (optional): The part of the word before the cursor
++ * @right: (out) (optional): The part of the word after the cursor
++ *
++ * Finds the word the cursor is in. `left` is the tail of `before` and
++ * `right` the head of `after` up to the next word separator (see
++ * `pos_completer_symbol_is_word_separator()`). The preedit is not part of
++ * the surrounding text so it is not looked at: the caller inserts it
++ * between `left` and `right`. The byte lengths of `left` and `right`
++ * are what `delete_surrounding_text` needs to replace the word.
++ *
++ * Invalid UTF-8 is treated as empty.
++ *
++ * Returns: %TRUE if the cursor touches a word, %FALSE if both parts are empty
++ */
++gboolean
++pos_completer_word_at_cursor (const char *before, const char *after, char **left, char **right)
++{
++  const char *lstart = before;
++  const char *rend = after;
++  g_autofree char *l = NULL;
++  g_autofree char *r = NULL;
++
++  if (left)
++    *left = NULL;
++  if (right)
++    *right = NULL;
++
++  if (before && *before && g_utf8_validate (before, -1, NULL)) {
++    const char *end = before + strlen (before);
++    const char *p = end;
++
++    while (p > before) {
++      const char *prev = g_utf8_find_prev_char (before, p);
++      g_autofree char *symbol = g_strndup (prev, p - prev);
++
++      if (pos_completer_symbol_is_word_separator (symbol, NULL))
++        break;
++      p = prev;
++    }
++    lstart = p;
++    if (*lstart)
++      l = g_strdup (lstart);
++  }
++
++  if (after && *after && g_utf8_validate (after, -1, NULL)) {
++    const char *p = after;
++
++    while (*p) {
++      const char *next = g_utf8_next_char (p);
++      g_autofree char *symbol = g_strndup (p, next - p);
++
++      if (pos_completer_symbol_is_word_separator (symbol, NULL))
++        break;
++      p = next;
++    }
++    rend = p;
++    if (rend > after)
++      r = g_strndup (after, rend - after);
++  }
++
++  if (gm_str_is_null_or_empty (l) && gm_str_is_null_or_empty (r))
++    return FALSE;
++
++  if (left)
++    *left = g_steal_pointer (&l);
++  if (right)
++    *right = g_steal_pointer (&r);
++
++  return TRUE;
++}
++
++/**
+  * pos_completer_capitalize_by_template:
+  * @template: String with some characters in upper case
+  * @completions: List of completion strings
+diff -ruN a/src/pos-completer.h b/src/pos-completer.h
+--- a/src/pos-completer.h	2026-11-04 07:27:33.951725768 +0200
++++ b/src/pos-completer.h	2026-11-04 07:27:33.960752991 +0200
+@@ -108,6 +108,10 @@
+                                                      const GStrv completions);
+ 
+ glong          pos_completer_find_prev_word_break (const char *text);
++gboolean       pos_completer_word_at_cursor (const char *before,
++                                             const char *after,
++                                             char **left,
++                                             char **right);
+ gboolean       pos_completer_set_selected (PosCompleter *self, const char *selected);
+ void           pos_completer_toggle_mode (PosCompleter *self);
+ const char *   pos_completer_get_base_layout (PosCompleter *self);
+diff -ruN a/src/pos-hw-tracker.c b/src/pos-hw-tracker.c
+--- a/src/pos-hw-tracker.c	2026-11-04 07:27:33.951853312 +0200
++++ b/src/pos-hw-tracker.c	2026-11-04 07:27:33.957982234 +0200
+@@ -72,7 +72,9 @@
+                                  gpointer      device_state)
+ {
+   self->device_state = device_state;
+-  zphoc_device_state_v1_add_listener (self->device_state, &device_state_listener, self);
++  /* phoc's device-state global is optional: other compositors do not have it */
++  if (self->device_state)
++    zphoc_device_state_v1_add_listener (self->device_state, &device_state_listener, self);
+ }
+ 
+ 
+diff -ruN a/src/pos-input-method.c b/src/pos-input-method.c
+--- a/src/pos-input-method.c	2026-11-04 07:27:33.951898583 +0200
++++ b/src/pos-input-method.c	2026-11-04 07:27:33.961306668 +0200
+@@ -16,6 +16,8 @@
+ 
+ #include "input-method-unstable-v2-client-protocol.h"
+ 
++#include <string.h>
++
+ enum {
+   PROP_0,
+   PROP_MANAGER,
+@@ -130,7 +132,8 @@
+ {
+   PosInputMethod *self = POS_INPUT_METHOD (data);
+ 
+-  g_debug ("%s: '%s', cursor %d, anchor: %d", __func__, text, cursor, anchor);
++  g_debug ("%s: '%s' (%zu bytes), cursor %u, anchor: %u",
++           __func__, text, text ? strlen (text) : 0, cursor, anchor);
+   if (g_strcmp0 (self->pending->surrounding_text, text) == 0 &&
+       self->pending->cursor == cursor &&
+       self->pending->anchor == anchor)
+diff -ruN a/src/pos-input-surface.c b/src/pos-input-surface.c
+--- a/src/pos-input-surface.c	2026-11-04 07:27:33.951929904 +0200
++++ b/src/pos-input-surface.c	2026-11-04 07:27:33.960664358 +0200
+@@ -24,6 +24,7 @@
+ #include "pos-logind-session.h"
+ #include "pos-main.h"
+ #include "pos-osk-widget.h"
++#include "pos-osk-gesture.h"
+ #include "pos-settings-panel.h"
+ #include "pos-shortcuts-bar.h"
+ #include "pos-style-manager.h"
+@@ -127,6 +128,8 @@
+   HdyDeck                    *deck;
+   HdyClamp                   *clamp;
+   GtkWidget                  *osk_terminal;
++  char                      **menu_targets;   /* layout names of the open menu, NULL terminated */
++  gboolean                    menu_has_completion;
+   GtkWidget                  *emoji_picker;
+   GtkWidget                  *last_layout;
+   GtkWidget                  *keypad;
+@@ -502,8 +505,11 @@
+                             int              after)
+ {
+   g_debug ("%s: %s, (%d,%d)", __func__, text, before, after);
+-  if (before || after)
++  if (before || after) {
++    /* Drop the preedit explicitly so the whole replacement is one commit */
++    pos_input_method_send_preedit (self->input_method, "", 0, 0, FALSE);
+     pos_input_method_delete_surrounding_text (self->input_method, before, after, FALSE);
++  }
+   pos_input_method_send_string (self->input_method, text, TRUE);
+ }
+ 
+@@ -553,6 +559,71 @@
+ }
+ 
+ 
++/**
++ * pos_input_surface_delete_word_or_char:
++ * @self: The input surface
++ *
++ * Deletes one word before the cursor. A pending completer preedit counts
++ * as that word and is just dropped. Without surrounding text (or when the
++ * word is a single character) a single BackSpace is sent instead.
++ */
++static void
++pos_input_surface_delete_word_or_char (PosInputSurface *self)
++{
++  if (pos_input_surface_is_completer_active (self)) {
++    const char *preedit = pos_completer_get_preedit (self->completer);
++
++    if (!gm_str_is_null_or_empty (preedit)) {
++      g_debug ("%s: dropping preedit '%s'", __func__, preedit);
++      pos_completer_set_preedit (self->completer, NULL);
++      pos_input_method_send_preedit (self->input_method, "", 0, 0, TRUE);
++      return;
++    }
++  }
++
++  if (pos_input_method_get_active (self->input_method) &&
++      pos_input_surface_delete_last_word (self))
++    return;
++
++  pos_vk_driver_key_down (self->keyboard_driver, "KEY_BACKSPACE", POS_KEYCODE_MODIFIER_NONE);
++  pos_vk_driver_key_up (self->keyboard_driver, "KEY_BACKSPACE");
++}
++
++
++static void
++on_osk_delete_gesture (PosInputSurface *self, int kind, int phase, GtkWidget *osk_widget)
++{
++  g_return_if_fail (POS_IS_INPUT_SURFACE (self));
++  g_return_if_fail (POS_IS_OSK_WIDGET (osk_widget));
++
++  g_debug ("Delete gesture: kind %d, phase %d", kind, phase);
++
++  if (kind == POS_OSK_DELETE_GESTURE_CHARS) {
++    if (phase != POS_OSK_GESTURE_PHASE_END)
++      return;
++    pos_input_surface_trigger_feedback (self, KEY_PRESS_EVENT);
++    pos_input_surface_delete_word_or_char (self);
++    return;
++  }
++
++  if (kind != POS_OSK_DELETE_GESTURE_WORDS)
++    return;
++
++  if (phase == POS_OSK_GESTURE_PHASE_BEGIN) {
++    /* The key press was cancelled by the widget so the long press timer is
++     * gone; delete a word now and keep deleting words while the finger stays */
++    g_clear_handle_id (&self->bs_repeat_id, g_source_remove);
++    pos_input_surface_set_backspace_mode (self, POS_BACKSPACE_MODE_WORD);
++    pos_input_surface_trigger_feedback (self, KEY_PRESS_EVENT);
++    pos_input_surface_delete_word_or_char (self);
++    self->bs_repeat_id = g_timeout_add (BS_KEY_REPEAT_INTERVAL_WORD, on_bs_key_repeat, self);
++    g_source_set_name_by_id (self->bs_repeat_id, "[pos-bs-key-repeat]");
++  } else {
++    pos_input_surface_set_backspace_pressed (self, NULL);
++  }
++}
++
++
+ static void
+ on_osk_key_up (PosInputSurface *self)
+ {
+@@ -585,7 +656,11 @@
+ {
+   gboolean handled, is_bs;
+ 
+-  g_debug ("Key: '%s' symbol", symbol);
++  g_debug ("Key: '%s' symbol (im %s, completion %s, latched 0x%x)",
++           symbol,
++           pos_input_method_get_active (self->input_method) ? "active" : "inactive",
++           pos_input_surface_is_completion_mode (self) ? "on" : "off",
++           self->latched_modifiers);
+ 
+   is_bs = pos_input_surface_set_backspace_pressed (self, symbol);
+ 
+@@ -850,36 +925,7 @@
+ }
+ 
+ 
+-static void
+-menu_add_layout (PosInputSurface *self, PosOskWidget *osk_widget)
+-{
+-  GtkWidget *button;
+-  const char *name = pos_osk_widget_get_name (osk_widget);
+-  const char *display_name = pos_osk_get_display_name (osk_widget);
+-
+-  button = g_object_new (GTK_TYPE_MODEL_BUTTON,
+-                         "visible", TRUE,
+-                         "label", display_name,
+-                         "action-name", "win.select-layout",
+-                         "action-target", g_variant_new_string (name),
+-                         NULL);
+-  gtk_box_pack_start (self->menu_box_layouts, button, FALSE, FALSE, 0);
+-}
+-
+-
+-static void
+-menu_add_emoji_picker (PosInputSurface *self)
+-{
+-  GtkWidget *button;
+-
+-  button = g_object_new (GTK_TYPE_MODEL_BUTTON,
+-                         "visible", TRUE,
+-                         "label", _("Emoji"),
+-                         "action-name", "win.select-layout",
+-                         "action-target", g_variant_new_string ("emoji"),
+-                         NULL);
+-  gtk_box_pack_start (self->menu_box_layouts, button, FALSE, FALSE, 0);
+-}
++static void pos_input_surface_set_completion_enabled (PosInputSurface *self, gboolean enable);
+ 
+ 
+ static void
+@@ -888,38 +934,102 @@
+   PosInputSurface *self = POS_INPUT_SURFACE (data);
+   GdkRectangle rect = {};
+   GtkWidget *osk_widget;
+-  GAction *layout_action;
+   const char *osk_name;
++  GPtrArray *labels = g_ptr_array_new_with_free_func (g_free);
++  GPtrArray *targets = g_ptr_array_new_with_free_func (g_free);
++  int checked = -1;
++  guint mask = 0;
+ 
+   osk_widget = hdy_deck_get_visible_child (self->deck);
+   osk_name = pos_osk_widget_get_name (POS_OSK_WIDGET (osk_widget));
+   g_variant_get (parameter, "(ii)", &rect.x, &rect.y);
+   g_debug ("Menu popup activated at %d %d, current: '%s'", rect.x, rect.y, osk_name);
+ 
+-  layout_action = g_action_map_lookup_action (G_ACTION_MAP (self->action_map), "select-layout");
+-  g_simple_action_set_state (G_SIMPLE_ACTION (layout_action), g_variant_new ("s", osk_name));
+-
+-  gtk_container_foreach (GTK_CONTAINER (self->menu_box_layouts),
+-                         (GtkCallback) gtk_widget_destroy,
+-                         NULL);
+-
++  /* The menu is drawn and hit-tested by the osk widget itself, see
++   * pos_osk_widget_open_menu() for why it is not a GtkPopover */
+   for (int i = 0; i < self->osks->len; i++) {
+     PosOskWidget *osk = g_ptr_array_index (self->osks, i);
++    const char *name = pos_osk_widget_get_name (osk);
+ 
+-    menu_add_layout (self, osk);
++    if (g_strcmp0 (name, osk_name) == 0)
++      checked = labels->len;
++    g_ptr_array_add (labels, g_strdup (pos_osk_get_display_name (osk)));
++    g_ptr_array_add (targets, g_strdup (name));
+   }
+ 
+-  menu_add_layout (self, POS_OSK_WIDGET (self->osk_terminal));
+-  menu_add_emoji_picker (self);
++  if (g_strcmp0 ("terminal", osk_name) == 0 ||
++      GTK_WIDGET (osk_widget) == self->osk_terminal)
++    checked = labels->len;
++  g_ptr_array_add (labels, g_strdup (pos_osk_get_display_name (POS_OSK_WIDGET (self->osk_terminal))));
++  g_ptr_array_add (targets, g_strdup (pos_osk_widget_get_name (POS_OSK_WIDGET (self->osk_terminal))));
+ 
+-  gtk_widget_set_visible (self->word_completion_btn,
+-                          self->completer &&
+-                          !(self->completion_mode == PHOSH_OSK_COMPLETION_MODE_NONE));
++  g_ptr_array_add (labels, g_strdup (_("Emoji")));
++  g_ptr_array_add (targets, g_strdup ("emoji"));
+ 
+-  gtk_popover_set_relative_to (self->menu_popup, osk_widget);
+-  gtk_popover_set_pointing_to (self->menu_popup, &rect);
++  self->menu_has_completion = self->completer &&
++    !(self->completion_mode == PHOSH_OSK_COMPLETION_MODE_NONE);
++  if (self->menu_has_completion) {
++    g_ptr_array_add (labels, g_strdup (_("Word completion")));
++    if (self->completion_enabled)
++      mask |= 1u << (labels->len - 1);
++  }
+ 
+-  gtk_popover_popup (self->menu_popup);
++  g_strfreev (self->menu_targets);
++  g_ptr_array_add (targets, NULL);
++  self->menu_targets = (char **) g_ptr_array_free (targets, FALSE);
++  g_ptr_array_add (labels, NULL);
++
++  pos_osk_widget_open_menu (POS_OSK_WIDGET (osk_widget),
++                            (const char **) labels->pdata,
++                            labels->len - 1,
++                            checked,
++                            mask,
++                            rect.x,
++                            rect.y);
++  g_ptr_array_free (labels, TRUE);
++}
++
++
++static void
++on_osk_language_swipe (PosInputSurface *self, int direction, GtkWidget *osk_widget)
++{
++  GtkWidget *visible = hdy_deck_get_visible_child (self->deck);
++  guint idx = 0;
++  PosOskWidget *next;
++
++  if (self->osks->len < 2)
++    return;
++
++  for (guint i = 0; i < self->osks->len; i++) {
++    if (g_ptr_array_index (self->osks, i) == (gpointer) visible)
++      idx = i;
++  }
++  if (!g_ptr_array_find (self->osks, visible, NULL))
++    return;
++
++  idx = (idx + self->osks->len + direction) % self->osks->len;
++  next = g_ptr_array_index (self->osks, idx);
++  g_debug ("Language swipe %d: switching to '%s'", direction, pos_osk_widget_get_name (next));
++  g_action_group_activate_action (G_ACTION_GROUP (self->action_map), "select-layout",
++                                  g_variant_new_string (pos_osk_widget_get_name (next)));
++}
++
++
++static void
++on_osk_menu_picked (PosInputSurface *self, int idx)
++{
++  int n = self->menu_targets ? g_strv_length (self->menu_targets) : 0;
++
++  g_debug ("Menu item %d picked (%d layouts)", idx, n);
++  if (idx < 0)
++    return;
++
++  if (idx < n) {
++    g_action_group_activate_action (G_ACTION_GROUP (self->action_map), "select-layout",
++                                    g_variant_new_string (self->menu_targets[idx]));
++  } else if (self->menu_has_completion && idx == n) {
++    pos_input_surface_set_completion_enabled (self, !self->completion_enabled);
++  }
+ }
+ 
+ 
+@@ -1859,6 +1969,7 @@
+   gtk_widget_class_bind_template_callback (widget_class, on_mode_pressed);
+   gtk_widget_class_bind_template_callback (widget_class, on_num_shortcuts_changed);
+   gtk_widget_class_bind_template_callback (widget_class, on_osk_key_cancelled);
++  gtk_widget_class_bind_template_callback (widget_class, on_osk_menu_picked);
+   gtk_widget_class_bind_template_callback (widget_class, on_osk_key_down);
+   gtk_widget_class_bind_template_callback (widget_class, on_osk_key_up);
+   gtk_widget_class_bind_template_callback (widget_class, on_osk_key_symbol);
+@@ -2046,6 +2157,9 @@
+   gtk_widget_set_visible (GTK_WIDGET (osk_widget), TRUE);
+   g_object_connect (osk_widget,
+                     "swapped-signal::key-cancelled", G_CALLBACK (on_osk_key_cancelled), self,
++                    "swapped-signal::delete-gesture", G_CALLBACK (on_osk_delete_gesture), self,
++                    "swapped-signal::menu-picked", G_CALLBACK (on_osk_menu_picked), self,
++                    "swapped-signal::language-swipe", G_CALLBACK (on_osk_language_swipe), self,
+                     "swapped-signal::key-down", G_CALLBACK (on_osk_key_down), self,
+                     "swapped-signal::key-symbol", G_CALLBACK (on_osk_key_symbol), self,
+                     "swapped-signal::key-up", G_CALLBACK (on_osk_key_up), self,
+@@ -2228,9 +2342,12 @@
+ 
+   self->completion_mode = mode;
+ 
+-  /* In manual mode we don't interfere with the user's choice */
+-  if (self->completion_mode & PHOSH_OSK_COMPLETION_MODE_MANUAL)
++  /* In manual mode the user chooses with the menu button; start with completion on
++   * so the strip is there from the first keystroke (local change for testing) */
++  if (self->completion_mode & PHOSH_OSK_COMPLETION_MODE_MANUAL) {
++    pos_input_surface_set_completion_enabled (self, TRUE);
+     return;
++  }
+ 
+   /* In hint mode catch up with the input method */
+   if ((self->completion_mode & PHOSH_OSK_COMPLETION_MODE_HINT) && self->input_method) {
+diff -ruN a/src/pos-osk-gesture.c b/src/pos-osk-gesture.c
+--- a/src/pos-osk-gesture.c	1970-01-01 02:00:00.000000000 +0200
++++ b/src/pos-osk-gesture.c	2026-11-04 07:27:33.961276607 +0200
+@@ -0,0 +1,56 @@
++/*
++ * Copyright (C) 2026 The Phosh Developers
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#define G_LOG_DOMAIN "pos-osk-gesture"
++
++#include "pos-osk-gesture.h"
++
++/* Fraction of the widget width a letter key must slide left to delete */
++#define POS_OSK_CHAR_GESTURE_FRACTION 0.25
++
++/**
++ * pos_osk_classify_delete_gesture:
++ * @start_is_bs: Whether the touch started on the BackSpace key
++ * @dx: Horizontal offset from the touch start in pixels (negative is left)
++ * @dy: Vertical offset from the touch start in pixels
++ * @key_width: Width of the start key in pixels
++ * @widget_width: Width of the keyboard widget in pixels
++ *
++ * Classifies a touch movement as a delete gesture. Starting on
++ * BackSpace, sliding further left than one key width is a word delete
++ * that lasts while the finger stays down. Starting on another key,
++ * a mostly horizontal slide to the left over a quarter of the widget
++ * width is a single delete.
++ *
++ * This is pure so it can be unit tested without a display.
++ *
++ * Returns: The kind of delete gesture
++ */
++PosOskDeleteGesture
++pos_osk_classify_delete_gesture (gboolean start_is_bs,
++                                 double   dx,
++                                 double   dy,
++                                 double   key_width,
++                                 double   widget_width)
++{
++  if (dx >= 0.0)
++    return POS_OSK_DELETE_GESTURE_NONE;
++
++  if (start_is_bs) {
++    if (key_width <= 0.0 || -dx <= key_width)
++      return POS_OSK_DELETE_GESTURE_NONE;
++    return POS_OSK_DELETE_GESTURE_WORDS;
++  }
++
++  if (widget_width <= 0.0 || -dx <= widget_width * POS_OSK_CHAR_GESTURE_FRACTION)
++    return POS_OSK_DELETE_GESTURE_NONE;
++
++  /* Mostly horizontal */
++  if (ABS (dy) >= -dx / 2.0)
++    return POS_OSK_DELETE_GESTURE_NONE;
++
++  return POS_OSK_DELETE_GESTURE_CHARS;
++}
+diff -ruN a/src/pos-osk-gesture.h b/src/pos-osk-gesture.h
+--- a/src/pos-osk-gesture.h	1970-01-01 02:00:00.000000000 +0200
++++ b/src/pos-osk-gesture.h	2026-11-04 07:27:33.961249547 +0200
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2026 The Phosh Developers
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++
++#include <glib.h>
++
++G_BEGIN_DECLS
++
++/**
++ * PosOskDeleteGesture:
++ * @POS_OSK_DELETE_GESTURE_NONE: Not a delete gesture
++ * @POS_OSK_DELETE_GESTURE_CHARS: Delete one word (or char) once
++ * @POS_OSK_DELETE_GESTURE_WORDS: Delete words while the gesture lasts
++ *
++ * The kind of a slide-left delete gesture on the OSK.
++ */
++typedef enum {
++  POS_OSK_DELETE_GESTURE_NONE = 0,
++  POS_OSK_DELETE_GESTURE_CHARS,
++  POS_OSK_DELETE_GESTURE_WORDS,
++} PosOskDeleteGesture;
++
++/**
++ * PosOskGesturePhase:
++ * @POS_OSK_GESTURE_PHASE_BEGIN: The gesture was recognized
++ * @POS_OSK_GESTURE_PHASE_END: The finger was lifted
++ */
++typedef enum {
++  POS_OSK_GESTURE_PHASE_BEGIN = 0,
++  POS_OSK_GESTURE_PHASE_END,
++} PosOskGesturePhase;
++
++PosOskDeleteGesture pos_osk_classify_delete_gesture (gboolean start_is_bs,
++                                                     double   dx,
++                                                     double   dy,
++                                                     double   key_width,
++                                                     double   widget_width);
++
++G_END_DECLS
+diff -ruN a/src/pos-osk-widget.c b/src/pos-osk-widget.c
+--- a/src/pos-osk-widget.c	2026-11-04 07:27:33.952130290 +0200
++++ b/src/pos-osk-widget.c	2026-11-04 07:27:33.961358870 +0200
+@@ -11,6 +11,7 @@
+ 
+ #include "pos-config.h"
+ 
++#include <math.h>
+ #include "util.h"
+ #include "pos-char-popup.h"
+ #include "phosh-osk-enums.h"
+@@ -19,6 +20,7 @@
+ #include "pos-indicator-popup.h"
+ #include "pos-osk-key.h"
+ #include "pos-osk-widget.h"
++#include "pos-osk-gesture.h"
+ 
+ #include "gmobile.h"
+ 
+@@ -35,6 +37,9 @@
+ 
+ #define MINIMUM_WIDTH 360
+ 
++/* Horizontal travel (logical px) that makes a space bar swipe change the layout */
++#define SPACE_SWIPE_MIN_PX 40
++
+ #define EVENT_HISTORY_THRESHOLD_MS 150
+ 
+ enum {
+@@ -44,6 +49,9 @@
+   OSK_KEY_SYMBOL,
+   OSK_POPOVER_SHOWN,
+   OSK_POPOVER_HIDDEN,
++  OSK_DELETE_GESTURE,
++  OSK_MENU_PICKED,
++  OSK_LANGUAGE_SWIPE,
+   N_SIGNALS
+ };
+ static guint signals[N_SIGNALS];
+@@ -160,10 +168,25 @@
+ 
+   /* Cursor movement */
+   GtkGesture          *cursor_drag;
++  char               **menu_labels;
++  int                  menu_n;
++  int                  menu_checked;
++  guint                menu_checked_mask;
++  int                  menu_anchor_x;
++  int                  menu_anchor_y;
++  int                  menu_pressed;
++  gboolean             menu_touch_active;
+   double               last_x, last_y;
+   GArray              *event_history;
+   cursor_drag_t        drag_type;
+ 
++  /* Delete gestures (slide left) */
++  double               touch_start_x, touch_start_y;
++  PosOskKey           *touch_start_key;
++  gboolean             word_gesture_active;
++  gboolean             space_swipe;
++  double               space_swipe_dx;
++
+   /* Key scaling */
+   GtkCssProvider      *css_provider;
+   int key_scale;
+@@ -197,12 +220,15 @@
+     last_time = r->time;
+   }
+ 
++  /* A single record or two records with the same timestamp have no velocity */
+   if (first_time == last_time) {
+     if (v_x)
+-      *v_x = total_delta_x / (last_time - first_time);
++      *v_x = 0.0;
+ 
+     if (v_y)
+-      *v_y = total_delta_y / (last_time - first_time);
++      *v_y = 0.0;
++
++    return;
+   }
+ 
+   if (v_x)
+@@ -254,12 +280,11 @@
+                double        start_x,
+                double        start_y)
+ {
+-  if (self->mode != POS_OSK_WIDGET_MODE_CURSOR)
+-    return;
+-
++  /* The drag begins on touch begin, before the long press switches to
++   * cursor mode, so the per-drag state is reset in pos_osk_widget_set_mode()
++   * instead. The offsets passed to on_drag_update() are relative to the
++   * start so last_x/last_y start at 0 there. */
+   self->drag_type = CURSOR_DRAG_STARTING;
+-  self->last_x = start_x;
+-  self->last_y = start_y;
+ }
+ 
+ #define KEY_DIST_X 5
+@@ -1139,11 +1164,268 @@
+ }
+ 
+ 
++/**
++ * pos_osk_widget_check_delete_gesture:
++ * @self: The osk widget
++ * @x: Current touch x
++ * @y: Current touch y
++ *
++ * Classifies the movement of the current touch sequence since it began
++ * as a delete gesture. Only in keyboard mode, while no symbol popup is
++ * shown and when keys are not retargeted by dragging.
++ *
++ * Returns: The kind of delete gesture
++ */
++static PosOskDeleteGesture
++pos_osk_widget_check_delete_gesture (PosOskWidget *self, double x, double y)
++{
++  PosOskKey *key = self->touch_start_key;
++  const char *symbol;
++  gboolean is_bs;
++  double key_width;
++
++  if (!key)
++    return POS_OSK_DELETE_GESTURE_NONE;
++
++  if (self->mode != POS_OSK_WIDGET_MODE_KEYBOARD)
++    return POS_OSK_DELETE_GESTURE_NONE;
++
++  if (self->char_popup && gtk_widget_get_visible (self->char_popup))
++    return POS_OSK_DELETE_GESTURE_NONE;
++
++  if (self->features & PHOSH_OSK_FEATURE_KEY_DRAG)
++    return POS_OSK_DELETE_GESTURE_NONE;
++
++  is_bs = pos_osk_key_get_use (key) == POS_OSK_KEY_USE_DELETE;
++  symbol = pos_osk_key_get_symbol (key);
++  if (!is_bs) {
++    /* Only plain character keys start the single delete */
++    if (pos_osk_key_get_use (key) != POS_OSK_KEY_USE_KEY)
++      return POS_OSK_DELETE_GESTURE_NONE;
++    if (!symbol || g_str_has_prefix (symbol, "KEY_") || g_str_equal (symbol, POS_OSK_SYMBOL_SPACE))
++      return POS_OSK_DELETE_GESTURE_NONE;
++  }
++
++  key_width = pos_osk_key_get_box (key)->width;
++
++  return pos_osk_classify_delete_gesture (is_bs,
++                                          x - self->touch_start_x,
++                                          y - self->touch_start_y,
++                                          key_width,
++                                          self->width);
++}
++
++
++/* In-surface layout menu.
++ *
++ * A GtkPopover on a layer-shell surface becomes a separate xdg_popup whose
++ * touch input is offset from what is drawn on the phone. So the menu is
++ * drawn by the osk widget itself and hit-tested here with the same touch
++ * coordinates the keys use. */
++#define MENU_ITEM_H 40
++#define MENU_W 200
++#define MENU_PAD 6
++
++static void
++menu_clear_items (PosOskWidget *self)
++{
++  g_clear_pointer (&self->menu_labels, g_strfreev);
++  self->menu_n = 0;
++  self->menu_pressed = -1;
++}
++
++
++static void
++menu_get_rect (PosOskWidget *self, GdkRectangle *r)
++{
++  int h = self->menu_n * MENU_ITEM_H + 2 * MENU_PAD;
++
++  r->width = MENU_W;
++  r->height = h;
++  r->x = CLAMP (self->menu_anchor_x - 24, 4, MAX (4, self->width - MENU_W - 4));
++  r->y = MAX (2, self->menu_anchor_y - 14 - h);
++}
++
++
++static int
++menu_hit (PosOskWidget *self, double x, double y)
++{
++  GdkRectangle r;
++  int idx;
++
++  menu_get_rect (self, &r);
++  if (x < r.x || x >= r.x + r.width || y < r.y + MENU_PAD || y >= r.y + r.height - MENU_PAD)
++    return -1;
++  idx = (int) ((y - r.y - MENU_PAD) / MENU_ITEM_H);
++  return idx < self->menu_n ? idx : -1;
++}
++
++
++void
++pos_osk_widget_close_menu (PosOskWidget *self)
++{
++  g_return_if_fail (POS_IS_OSK_WIDGET (self));
++
++  if (self->menu_n == 0)
++    return;
++  menu_clear_items (self);
++  gtk_widget_queue_draw (GTK_WIDGET (self));
++}
++
++
++/**
++ * pos_osk_widget_open_menu:
++ * @labels: (array length=n): item labels
++ * @checked: index of the item drawn as selected, or -1
++ * @toggled: for items listed in @toggles (bitmask) a checked/unchecked state
++ *
++ * Opens the layout menu above the given anchor point. Picking an item emits
++ * "menu-picked" with its index.
++ */
++void
++pos_osk_widget_open_menu (PosOskWidget *self,
++                          const char  **labels,
++                          int           n,
++                          int           checked,
++                          guint         checked_mask,
++                          int           anchor_x,
++                          int           anchor_y)
++{
++  g_return_if_fail (POS_IS_OSK_WIDGET (self));
++
++  menu_clear_items (self);
++  self->menu_labels = g_strdupv ((char **) labels);
++  self->menu_n = n;
++  self->menu_checked = checked;
++  self->menu_checked_mask = checked_mask;
++  self->menu_anchor_x = anchor_x;
++  self->menu_anchor_y = anchor_y;
++  self->menu_pressed = -1;
++  gtk_widget_queue_draw (GTK_WIDGET (self));
++}
++
++
++static void
++menu_draw (PosOskWidget *self, cairo_t *cr)
++{
++  GtkStyleContext *ctx = self->key_context;
++  GtkStateFlags state = gtk_style_context_get_state (ctx);
++  GdkRGBA fg, bg;
++  GdkRectangle r;
++  PangoFontDescription *font = NULL;
++  PangoLayout *layout;
++
++  if (self->menu_n == 0)
++    return;
++
++  gtk_style_context_get_color (ctx, state, &fg);
++  gtk_style_context_get (ctx, state, "background-color", &bg, "font", &font, NULL);
++  menu_get_rect (self, &r);
++
++  cairo_save (cr);
++  cairo_set_source_rgba (cr, 0, 0, 0, 0.45);
++  cairo_rectangle (cr, r.x + 2, r.y + 3, r.width, r.height);
++  cairo_fill (cr);
++  cairo_set_source_rgb (cr, bg.red * 0.55, bg.green * 0.55, bg.blue * 0.55);
++  cairo_rectangle (cr, r.x, r.y, r.width, r.height);
++  cairo_fill (cr);
++  cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, 0.35);
++  cairo_set_line_width (cr, 1);
++  cairo_rectangle (cr, r.x + 0.5, r.y + 0.5, r.width - 1, r.height - 1);
++  cairo_stroke (cr);
++
++  layout = gtk_widget_create_pango_layout (GTK_WIDGET (self), NULL);
++  if (font)
++    pango_layout_set_font_description (layout, font);
++
++  for (int i = 0; i < self->menu_n; i++) {
++    int y = r.y + MENU_PAD + i * MENU_ITEM_H;
++    gboolean on = (i == self->menu_checked) || (self->menu_checked_mask & (1u << i));
++    int tw, th;
++    char *text;
++
++    if (i == self->menu_pressed) {
++      cairo_set_source_rgb (cr, bg.red, bg.green, bg.blue);
++      cairo_rectangle (cr, r.x + 2, y, r.width - 4, MENU_ITEM_H);
++      cairo_fill (cr);
++    }
++
++    text = g_strdup_printf ("%s  %s", on ? "●" : "○", self->menu_labels[i]);
++    pango_layout_set_text (layout, text, -1);
++    pango_layout_get_pixel_size (layout, &tw, &th);
++    cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, on ? 1.0 : 0.8);
++    cairo_move_to (cr, r.x + 14, y + (MENU_ITEM_H - th) / 2);
++    pango_cairo_show_layout (cr, layout);
++    g_free (text);
++  }
++
++  g_object_unref (layout);
++  if (font)
++    pango_font_description_free (font);
++  cairo_restore (cr);
++}
++
++
++static gboolean
++pos_osk_widget_menu_touch (PosOskWidget *self, GdkEventTouch *event)
++{
++  int idx;
++
++  if (self->menu_n == 0)
++    return FALSE;
++
++  idx = menu_hit (self, event->x, event->y);
++  g_debug ("Menu touch type %d at (%f, %f): item %d", event->type, event->x, event->y, idx);
++
++  if (event->type == GDK_TOUCH_BEGIN) {
++    GdkRectangle r;
++
++    menu_get_rect (self, &r);
++    self->menu_touch_active = TRUE;
++    self->menu_pressed = idx;
++    if (idx < 0 && !(event->x >= r.x && event->x < r.x + r.width &&
++                     event->y >= r.y && event->y < r.y + r.height)) {
++      /* touch outside the menu closes it */
++      menu_clear_items (self);
++    }
++    gtk_widget_queue_draw (GTK_WIDGET (self));
++    return TRUE;
++  }
++
++  if (!self->menu_touch_active)
++    return self->menu_n > 0;
++
++  if (event->type == GDK_TOUCH_UPDATE) {
++    self->menu_pressed = idx;
++    gtk_widget_queue_draw (GTK_WIDGET (self));
++    return TRUE;
++  }
++
++  if (event->type == GDK_TOUCH_END || event->type == GDK_TOUCH_CANCEL) {
++    int picked = (event->type == GDK_TOUCH_END) ? idx : -1;
++
++    self->menu_touch_active = FALSE;
++    self->menu_pressed = -1;
++    if (picked >= 0) {
++      menu_clear_items (self);
++      gtk_widget_queue_draw (GTK_WIDGET (self));
++      g_signal_emit (self, signals[OSK_MENU_PICKED], 0, picked);
++    } else {
++      gtk_widget_queue_draw (GTK_WIDGET (self));
++    }
++  }
++  return TRUE;
++}
++
++
+ static gboolean
+ pos_osk_widget_touch_event (GtkWidget *widget, GdkEventTouch *event)
+ {
+   PosOskWidget *self = POS_OSK_WIDGET (widget);
+ 
++  if (pos_osk_widget_menu_touch (self, event))
++    return GDK_EVENT_STOP;
++
+   g_debug ("Touch event: seq: %p (%f, %f), type: %d",
+            event->sequence,
+            event->x,
+@@ -1151,6 +1433,10 @@
+            event->type);
+ 
+   if (event->type == GDK_TOUCH_BEGIN) {
++    if (self->char_popup && gtk_widget_get_visible (self->char_popup)) {
++      /* a touch on the keyboard itself (outside the popup) closes it */
++      gtk_popover_popdown (GTK_POPOVER (self->char_popup));
++    }
+     if (self->current) {
+       key_repeat_cancel (self);
+       pos_osk_widget_set_mode (self, POS_OSK_WIDGET_MODE_KEYBOARD);
+@@ -1158,14 +1444,65 @@
+     }
+ 
+     self->sequence = event->sequence;
++    self->touch_start_x = event->x;
++    self->touch_start_y = event->y;
++    self->word_gesture_active = FALSE;
++    self->space_swipe = FALSE;
+     pos_osk_widget_key_press (self, event->x, event->y);
++    self->touch_start_key = self->current;
+     return GDK_EVENT_STOP;
+   }
+ 
+   if (event->sequence != self->sequence)
+     return GDK_EVENT_PROPAGATE;
+ 
++  /* Long press popup open: the finger that opened it can slide to a symbol and
++   * select it by lifting (like on phone keyboards). A plain lift outside keeps
++   * the popup open so it can still be tapped. */
++  if (self->char_popup && gtk_widget_get_visible (self->char_popup)) {
++    if (event->type == GDK_TOUCH_UPDATE) {
++      pos_char_popup_slide_to (POS_CHAR_POPUP (self->char_popup), widget, event->x, event->y);
++      return GDK_EVENT_STOP;
++    } else if (event->type == GDK_TOUCH_END) {
++      if (pos_char_popup_release_at (POS_CHAR_POPUP (self->char_popup), widget, event->x, event->y))
++        return GDK_EVENT_STOP;
++    }
++  }
++
+   if (event->type == GDK_TOUCH_END || event->type == GDK_TOUCH_CANCEL) {
++    if (self->space_swipe) {
++      double dx = self->space_swipe_dx;
++
++      self->space_swipe = FALSE;
++      self->touch_start_key = NULL;
++      pos_osk_widget_cancel_press (self);
++      if (event->type == GDK_TOUCH_END && fabs (dx) >= SPACE_SWIPE_MIN_PX) {
++        g_debug ("Language swipe, dx %f", dx);
++        g_signal_emit (self, signals[OSK_LANGUAGE_SWIPE], 0, dx < 0 ? 1 : -1);
++      }
++      return GDK_EVENT_STOP;
++    }
++
++    if (self->word_gesture_active) {
++      self->word_gesture_active = FALSE;
++      self->touch_start_key = NULL;
++      g_signal_emit (self, signals[OSK_DELETE_GESTURE], 0,
++                     POS_OSK_DELETE_GESTURE_WORDS, POS_OSK_GESTURE_PHASE_END);
++      return GDK_EVENT_STOP;
++    }
++
++    if (event->type == GDK_TOUCH_END &&
++        pos_osk_widget_check_delete_gesture (self, event->x, event->y) ==
++        POS_OSK_DELETE_GESTURE_CHARS) {
++      /* The key the finger ends on must not be typed */
++      pos_osk_widget_cancel_press (self);
++      self->touch_start_key = NULL;
++      g_signal_emit (self, signals[OSK_DELETE_GESTURE], 0,
++                     POS_OSK_DELETE_GESTURE_CHARS, POS_OSK_GESTURE_PHASE_END);
++      return GDK_EVENT_STOP;
++    }
++    self->touch_start_key = NULL;
++
+     if (self->current) {
+       key_repeat_cancel (self);
+       pos_osk_widget_set_mode (self, POS_OSK_WIDGET_MODE_KEYBOARD);
+@@ -1174,6 +1511,42 @@
+   } else if (event->type == GDK_TOUCH_UPDATE) {
+     PosOskKey *key;
+ 
++    /* Word delete in progress: the surface repeats until the finger lifts */
++    if (self->word_gesture_active)
++      return GDK_EVENT_STOP;
++
++    if (pos_osk_widget_check_delete_gesture (self, event->x, event->y) ==
++        POS_OSK_DELETE_GESTURE_WORDS) {
++      /* Cancel the BackSpace press (this stops the surface's key repeat)
++       * and hand over to the word delete gesture */
++      pos_osk_widget_cancel_press (self);
++      self->word_gesture_active = TRUE;
++      g_signal_emit (self, signals[OSK_DELETE_GESTURE], 0,
++                     POS_OSK_DELETE_GESTURE_WORDS, POS_OSK_GESTURE_PHASE_BEGIN);
++      return GDK_EVENT_STOP;
++    }
++
++    /* A quick horizontal swipe that starts on the space bar changes the
++     * layout. Holding the space bar first (long press) is the caret mode
++     * and wins, so a swipe is only recognised before that mode starts. */
++    if (self->space_swipe) {
++      self->space_swipe_dx = event->x - self->touch_start_x;
++      return GDK_EVENT_STOP;
++    }
++    if (self->touch_start_key &&
++        g_strcmp0 (pos_osk_key_get_symbol (self->touch_start_key), POS_OSK_SYMBOL_SPACE) == 0 &&
++        self->mode != POS_OSK_WIDGET_MODE_CURSOR) {
++      double dx = event->x - self->touch_start_x;
++      double dy = event->y - self->touch_start_y;
++
++      if (fabs (dx) >= SPACE_SWIPE_MIN_PX && fabs (dx) > 1.5 * fabs (dy)) {
++        pos_osk_widget_cancel_press (self);
++        self->space_swipe = TRUE;
++        self->space_swipe_dx = dx;
++        return GDK_EVENT_STOP;
++      }
++    }
++
+     if (!self->current)
+       return GDK_EVENT_PROPAGATE;
+ 
+@@ -1258,6 +1631,9 @@
+ 
+   g_debug ("Long press '%s'", pos_osk_key_get_label (key) ?: pos_osk_key_get_symbol (key));
+ 
++  if (self->space_swipe)
++    return;
++
+   if (g_strcmp0 (pos_osk_key_get_symbol (key), POS_OSK_SYMBOL_SPACE) == 0) {
+     key_repeat_cancel (self);
+     /* Remember the key we want to untoggle when mode ends */
+@@ -1281,6 +1657,10 @@
+   pos_osk_widget_cancel_press (self);
+   g_clear_pointer (&self->char_popup, phosh_cp_widget_destroy);
+   self->char_popup = GTK_WIDGET (pos_char_popup_new (GTK_WIDGET (self), symbols));
++  /* Non-modal: the finger that opened the popup keeps sending touch events to this
++   * widget, so it can slide to a symbol and lift (a modal popover swallows them).
++   * It is closed by the next touch on the keyboard or by a selection. */
++  gtk_popover_set_modal (GTK_POPOVER (self->char_popup), FALSE);
+ 
+   get_popup_pos (key, &rect);
+   gtk_popover_set_pointing_to (GTK_POPOVER (self->char_popup), &rect);
+@@ -1608,6 +1988,7 @@
+   }
+ 
+   cairo_restore (cr);
++  menu_draw (self, cr);
+   return FALSE;
+ }
+ 
+@@ -1617,6 +1998,7 @@
+ {
+   PosOskWidget *self = POS_OSK_WIDGET (object);
+ 
++  g_clear_pointer (&self->menu_labels, g_strfreev);
+   g_clear_handle_id (&self->repeat_id, g_source_remove);
+   pos_osk_widget_layout_free (&self->layout);
+   g_clear_object (&self->long_press);
+@@ -1798,6 +2180,47 @@
+                                               0, NULL, NULL, NULL,
+                                               G_TYPE_NONE,
+                                               0);
++  /**
++   * PosOskWidget::delete-gesture
++   * @self: The osk widget
++   * @kind: The #PosOskDeleteGesture
++   * @phase: The #PosOskGesturePhase
++   *
++   * The user slid left on BackSpace (`WORDS`, emitted with `BEGIN` when
++   * recognized and `END` when the finger lifts) or on a character key
++   * (`CHARS`, emitted once with `END`).
++   */
++  signals[OSK_DELETE_GESTURE] = g_signal_new ("delete-gesture",
++                                              G_TYPE_FROM_CLASS (klass),
++                                              G_SIGNAL_RUN_LAST,
++                                              0, NULL, NULL, NULL,
++                                              G_TYPE_NONE,
++                                              2,
++                                              G_TYPE_INT,
++                                              G_TYPE_INT);
++
++  /**
++   * PosOskWidget::language-swipe:
++   * @self: The osk widget
++   * @direction: 1 for a swipe to the left (next layout), -1 to the right
++   *
++   * A quick horizontal swipe on the space bar asks for another layout.
++   */
++  signals[OSK_LANGUAGE_SWIPE] = g_signal_new ("language-swipe",
++                                              G_TYPE_FROM_CLASS (klass),
++                                              G_SIGNAL_RUN_LAST,
++                                              0, NULL, NULL, NULL,
++                                              G_TYPE_NONE,
++                                              1,
++                                              G_TYPE_INT);
++
++  signals[OSK_MENU_PICKED] = g_signal_new ("menu-picked",
++                                           G_TYPE_FROM_CLASS (klass),
++                                           G_SIGNAL_RUN_LAST,
++                                           0, NULL, NULL, NULL,
++                                           G_TYPE_NONE,
++                                           1,
++                                           G_TYPE_INT);
+ 
+   gtk_widget_class_set_css_name (widget_class, "pos-osk-widget");
+ }
+@@ -2073,6 +2496,10 @@
+ 
+   if (mode == POS_OSK_WIDGET_MODE_CURSOR) {
+     self->current = NULL;
++    /* Each cursor drag starts unclassified, otherwise a drag once classified
++     * as vertical blocks horizontal caret moves on all later drags */
++    self->drag_type = CURSOR_DRAG_STARTING;
++    g_array_set_size (self->event_history, 0);
+   } else if (self->space) {
+     pos_osk_widget_set_key_pressed (self, self->space, FALSE);
+     self->space = NULL;
+diff -ruN a/src/pos-osk-widget.h b/src/pos-osk-widget.h
+--- a/src/pos-osk-widget.h	2026-11-04 07:27:33.952160751 +0200
++++ b/src/pos-osk-widget.h	2026-11-04 07:27:33.956447296 +0200
+@@ -41,5 +41,9 @@
+ const char *const *pos_osk_widget_get_symbols (PosOskWidget *self);
+ void              pos_osk_widget_set_key_height (PosOskWidget *self, guint key_height);
+ guint             pos_osk_widget_max_rows (PosOskWidget *self);
++void              pos_osk_widget_open_menu (PosOskWidget *self, const char **labels, int n,
++                                            int checked, guint checked_mask,
++                                            int anchor_x, int anchor_y);
++void              pos_osk_widget_close_menu (PosOskWidget *self);
+ 
+ G_END_DECLS
+diff -ruN a/src/pos-wayland.c b/src/pos-wayland.c
+--- a/src/pos-wayland.c	2026-11-04 07:27:33.952366958 +0200
++++ b/src/pos-wayland.c	2026-11-04 07:27:33.956873279 +0200
+@@ -387,6 +387,5 @@
+           self->zwlr_foreign_toplevel_manager_v1 &&
+           self->layer_shell &&
+           self->zxdg_output_manager_v1 &&
+-          self->zphoc_device_state_v1 &&
+           self->ext_data_control_manager);
+ }
+diff -ruN a/src/ui/input-surface.ui b/src/ui/input-surface.ui
+--- a/src/ui/input-surface.ui	2026-11-04 07:27:33.952513872 +0200
++++ b/src/ui/input-surface.ui	2026-11-04 07:27:33.961188525 +0200
+@@ -41,6 +41,7 @@
+                   <object class="PosOskWidget" id="osk_terminal">
+                     <property name="visible">1</property>
+                     <signal name="key-cancelled" handler="on_osk_key_cancelled" object="PosInputSurface" swapped="yes"/>
++                    <signal name="menu-picked" handler="on_osk_menu_picked" object="PosInputSurface" swapped="yes"/>
+                     <signal name="key-down" handler="on_osk_key_down" object="PosInputSurface" swapped="yes"/>
+                     <signal name="key-symbol" handler="on_osk_key_symbol" object="PosInputSurface" swapped="yes"/>
+                     <signal name="key-up" handler="on_osk_key_up" object="PosInputSurface" swapped="yes"/>
+@@ -101,7 +102,7 @@
+             </child>
+             <child>
+               <object class="GtkButton">
+-                <property name="visible">1</property>
++                <property name="visible">0</property>
+                 <property name="label" translatable="yes">Keyboard Settings</property>
+                 <property name="action-name">win.settings</property>
+                 <style>
+@@ -115,7 +116,7 @@
+           <object class="GtkButtonBox">
+             <property name="name">cutnpaste</property>
+             <property name="halign">center</property>
+-            <property name="visible">1</property>
++            <property name="visible">0</property>
+             <property name="margin-top">6</property>
+             <property name="margin-bottom">6</property>
+             <property name="layout-style">center</property>
+diff -ruN a/tests/meson.build b/tests/meson.build
+--- a/tests/meson.build	2026-11-04 07:27:33.952684128 +0200
++++ b/tests/meson.build	2026-11-04 07:27:33.961930638 +0200
+@@ -26,6 +26,7 @@
+   'input-surface',
+   'load-layouts',
+   'osk-widget',
++  'osk-gesture',
+   'completers',
+   'emoji-db',
+   'size-manager',
+diff -ruN a/tests/test-completer.c b/tests/test-completer.c
+--- a/tests/test-completer.c	2026-11-04 07:27:33.952774891 +0200
++++ b/tests/test-completer.c	2026-11-04 07:27:33.961722131 +0200
+@@ -10,6 +10,7 @@
+ #include "pos-completer-priv.h"
+ 
+ #include <glib.h>
++#include <string.h>
+ 
+ static void
+ test_grab_last_word (void)
+@@ -60,6 +61,57 @@
+ }
+ 
+ 
++static void
++test_word_at_cursor (void)
++{
++  char *left = NULL;
++  char *right = NULL;
++
++  /* Greek word split by the cursor, preedit not part of surrounding text */
++  g_assert_true (pos_completer_word_at_cursor ("ok καλημέ", "", &left, &right));
++  g_assert_cmpstr (left, ==, "καλημέ");
++  g_assert_cmpuint (strlen (left), ==, strlen ("καλημέ"));
++  g_assert_null (right);
++  g_clear_pointer (&left, g_free);
++
++  /* Caret in the middle of a word with a suffix and more text after */
++  g_assert_true (pos_completer_word_at_cursor ("say hel", "lo world", &left, &right));
++  g_assert_cmpstr (left, ==, "hel");
++  g_assert_cmpstr (right, ==, "lo");
++  g_clear_pointer (&left, g_free);
++  g_clear_pointer (&right, g_free);
++
++  /* Apostrophes stay inside the word, commas split */
++  g_assert_true (pos_completer_word_at_cursor ("it's don", "t, ok", &left, &right));
++  g_assert_cmpstr (left, ==, "don");
++  g_assert_cmpstr (right, ==, "t");
++  g_clear_pointer (&left, g_free);
++  g_clear_pointer (&right, g_free);
++
++  /* Only a suffix */
++  g_assert_true (pos_completer_word_at_cursor ("ends with ", "word.", &left, &right));
++  g_assert_null (left);
++  g_assert_cmpstr (right, ==, "word");
++  g_clear_pointer (&right, g_free);
++
++  /* No word around the cursor */
++  g_assert_false (pos_completer_word_at_cursor (NULL, NULL, &left, &right));
++  g_assert_null (left);
++  g_assert_null (right);
++  g_assert_false (pos_completer_word_at_cursor ("", "", &left, &right));
++  g_assert_false (pos_completer_word_at_cursor ("ends with ", " starts with", &left, &right));
++  g_assert_null (left);
++  g_assert_null (right);
++
++  /* Invalid UTF-8 is ignored */
++  g_assert_false (pos_completer_word_at_cursor ("abc\xff", "", &left, &right));
++  g_assert_null (left);
++
++  /* Out params are optional */
++  g_assert_true (pos_completer_word_at_cursor ("word", "", NULL, NULL));
++}
++
++
+ int
+ main (int argc, char *argv[])
+ {
+@@ -67,6 +119,7 @@
+ 
+   g_test_add_func ("/pos/completer/grab_last_word", test_grab_last_word);
+   g_test_add_func ("/pos/completer/find_prev_word_break", test_find_prev_word_break);
++  g_test_add_func ("/pos/completer/word_at_cursor", test_word_at_cursor);
+ 
+   return g_test_run ();
+ }
+diff -ruN a/tests/test-completer-hunspell.c b/tests/test-completer-hunspell.c
+--- a/tests/test-completer-hunspell.c	2026-11-04 07:27:33.952740739 +0200
++++ b/tests/test-completer-hunspell.c	2026-11-04 07:27:33.961990790 +0200
+@@ -48,12 +48,80 @@
+ }
+ 
+ 
++static void
++on_commit_string (PosCompleter *completer, const char *text, int before, int after, gpointer data)
++{
++  char **got = data;
++
++  g_assert_null (*got);
++  *got = g_strdup_printf ("%s|%d|%d", text, before, after);
++}
++
++
++static void
++test_completer_hunspell_whole_word (void)
++{
++#ifdef POS_HAVE_HUNSPELL
++  PosCompleter *hunspell;
++  g_autoptr (GError) err = NULL;
++  g_auto (GStrv) completions = NULL;
++  g_autofree char *commit = NULL;
++
++  if (!pos_completer_hunspell_find_dict (POS_COMPLETER_DEFAULT_LANG,
++                                         POS_COMPLETER_DEFAULT_REGION,
++                                         NULL,
++                                         NULL)) {
++    g_test_skip ("Hunspell data not found");
++    return;
++  }
++
++  hunspell = g_initable_new (POS_TYPE_COMPLETER_HUNSPELL, NULL, &err, NULL);
++  g_assert_no_error (err);
++  g_signal_connect (hunspell, "commit-string", G_CALLBACK (on_commit_string), &commit);
++
++  /* The cursor sits after "hel" of "hello": typing "l" looks up "hell" + "o" */
++  pos_completer_set_surrounding_text (hunspell, "say hel", "o world");
++  pos_completer_feed_symbol (hunspell, "l");
++  completions = pos_completer_get_completions (hunspell);
++  g_assert_cmpint (g_strv_length (completions), >, 0);
++  g_assert_true (g_strv_contains ((const char * const *)completions, "hello"));
++
++  /* Accepting replaces the parts around the preedit; no extra space before " world" */
++  g_assert_true (pos_completer_set_selected (hunspell, "hello"));
++  g_assert_cmpstr (commit, ==, "hello|3|1");
++  g_clear_pointer (&commit, g_free);
++
++  /* Without surrounding text the selection is left to the caller */
++  pos_completer_set_preedit (hunspell, NULL);
++  pos_completer_set_surrounding_text (hunspell, "", "");
++  pos_completer_feed_symbol (hunspell, "t");
++  g_assert_false (pos_completer_set_selected (hunspell, "the"));
++  g_assert_null (commit);
++
++  /* Cursor inside a word with an empty preedit still suggests */
++  pos_completer_set_preedit (hunspell, NULL);
++  pos_completer_set_surrounding_text (hunspell, "wor", "ld");
++  g_clear_pointer (&completions, g_strfreev);
++  completions = pos_completer_get_completions (hunspell);
++  g_assert_true (g_strv_contains ((const char * const *)completions, "world"));
++  g_assert_true (pos_completer_set_selected (hunspell, "world"));
++  g_assert_cmpstr (commit, ==, "world |3|2");
++  g_clear_pointer (&commit, g_free);
++
++  g_assert_finalize_object (hunspell);
++#else
++  g_test_skip ("Hunspell completer not available");
++#endif
++}
++
++
+ int
+ main (int argc, char *argv[])
+ {
+   gtk_test_init (&argc, &argv, NULL);
+ 
+   g_test_add_func ("/pos/completer/hunspell/object", test_completer_hunspell_object);
++  g_test_add_func ("/pos/completer/hunspell/whole-word", test_completer_hunspell_whole_word);
+ 
+   return g_test_run ();
+ }
+diff -ruN a/tests/test-osk-gesture.c b/tests/test-osk-gesture.c
+--- a/tests/test-osk-gesture.c	1970-01-01 02:00:00.000000000 +0200
++++ b/tests/test-osk-gesture.c	2026-11-04 07:27:33.962030981 +0200
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2026 The Phosh Developers
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "pos-osk-gesture.h"
++
++#include <glib.h>
++
++#define KEY_W 40.0
++#define WIDGET_W 400.0
++
++
++static void
++test_classify_backspace (void)
++{
++  /* Slide left further than one key width: word delete */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (TRUE, -41.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_WORDS);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (TRUE, -200.0, 30.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_WORDS);
++  /* Not far enough, to the right, or straight down: nothing */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (TRUE, -40.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (TRUE, -10.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (TRUE, 100.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (TRUE, 0.0, 100.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  /* Unknown key width */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (TRUE, -100.0, 0.0, 0.0, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++}
++
++
++static void
++test_classify_letter (void)
++{
++  /* Slide left over a quarter of the widget, mostly horizontal: one delete */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -101.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_CHARS);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -120.0, 59.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_CHARS);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -120.0, -59.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_CHARS);
++  /* Too short */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -100.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -41.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  /* Diagonal or down */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -120.0, 60.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -120.0, 200.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, 0.0, 200.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  /* Right */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, 200.0, 0.0, KEY_W, WIDGET_W), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++  /* Unknown widget width */
++  g_assert_cmpint (pos_osk_classify_delete_gesture (FALSE, -200.0, 0.0, KEY_W, 0.0), ==,
++                   POS_OSK_DELETE_GESTURE_NONE);
++}
++
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/pos/osk-gesture/classify/backspace", test_classify_backspace);
++  g_test_add_func ("/pos/osk-gesture/classify/letter", test_classify_letter);
++
++  return g_test_run ();
++}
