@@ -1,0 +1,26 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Start a second Chromium whose DevTools port is open on 127.0.0.1 only, with a
+# profile of its own: Chromium 136 and later ignore --remote-debugging-port on
+# the default profile, and nothing from the user's real browser (cookies,
+# logins, passwords) is shared. The wrapper adds ~/.config/chromium-flags.conf
+# before these flags, so the address and port below win over anything there.
+#   omamobile-cdp [URL...]     start; it runs until its window is closed
+# --autoplay-policy: a page driven over the DevTools port has no real touch, so
+# its sound would stay suspended without it.
+# From another computer: ssh -L 9222:127.0.0.1:9222 phone, then lib/cdp.py.
+set -euo pipefail
+port=${OMAMOBILE_CDP_PORT:-9222}
+[[ $port =~ ^[0-9]+$ ]] || { echo "omamobile-cdp: OMAMOBILE_CDP_PORT must be a number" >&2; exit 1; }
+dir=${OMAMOBILE_CDP_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/omamobile-cdp}
+for a in "$@"; do
+  case $a in
+    --remote-debugging-*|--user-data-dir*|--remote-allow-origins*)
+      echo "omamobile-cdp: $a is set by this script (127.0.0.1 only, its own profile) and cannot be passed" >&2; exit 1 ;;
+  esac
+done
+mkdir -p "$dir"
+logger -t omamobile-cdp "starting on 127.0.0.1:$port, profile $dir" 2>/dev/null || true
+exec chromium --user-data-dir="$dir" \
+  --remote-debugging-address=127.0.0.1 --remote-debugging-port="$port" \
+  --autoplay-policy=no-user-gesture-required --class=omamobile-cdp "$@"
