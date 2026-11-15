@@ -69,6 +69,7 @@ for f in usr/bin/reboot-to \
          usr/lib/systemd/logind.conf.d/10-omamobile-power-key.conf \
          usr/lib/NetworkManager/conf.d/10-omamobile-usb.conf \
          usr/lib/systemd/sleep.conf.d/10-omamobile.conf \
+         usr/lib/systemd/system/service.d/10-omamobile-husky-sleep-watchdog.conf \
          usr/lib/modprobe.d/omamobile-husky-clk-acpm.conf \
          usr/lib/modprobe.d/omamobile-husky-display.conf \
          usr/lib/systemd/system/omamobile-husky-display.service \
@@ -89,6 +90,14 @@ grep -qx 'MemorySleepMode=s2idle' "$tmp/root/usr/lib/systemd/sleep.conf.d/10-oma
   || fail "suspend must use s2idle: the kernel's default is deep, which zuma can't wake from yet"
 grep -qx 'AllowHibernation=no' "$tmp/root/usr/lib/systemd/sleep.conf.d/10-omamobile.conf" \
   || fail "there is no swap to hibernate to"
+# The sleep runs with the kernel's clock ticking, so no service watchdog may
+# outlast it: one drop-in for every service, and nothing else in it (the
+# Pixel 9a's check).
+wd=$tmp/root/usr/lib/systemd/system/service.d/10-omamobile-husky-sleep-watchdog.conf
+[[ $(grep -v '^#' "$wd" | grep -c .) == 2 && $(grep -v '^#' "$wd" | paste -sd' ') == "[Service] WatchdogSec=0" ]] \
+  || fail "the service drop-in turns the watchdogs off and does nothing else"
+[[ $(find "$tmp/root/usr/lib/systemd/system/service.d" -type f | wc -l) == 1 ]] || fail "one drop-in for all services, no more"
+! grep -rl '^WatchdogSec=' vendor/systemd/system --include='*.service' || fail "a unit of this package sets a watchdog the sleep would trip"
 grep -q 'KERNEL=="sda", MODE="0000"' "$tmp/root/usr/lib/udev/rules.d/10-omamobile-storage.rules" \
   || fail "the whole-disk node is made inaccessible"
 grep -q 'ID_PART_ENTRY_NAME}!="userdata"' "$tmp/root/usr/lib/udev/rules.d/10-omamobile-storage.rules" \
